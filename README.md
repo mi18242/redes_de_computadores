@@ -1,10 +1,11 @@
-# Integrantes
+# Projeto de Fundamento de Redes de Computadores
+## Integrantes
 João Pedro Marinho de Souza  
 Ismael Álvaro Lima da Silva  
 Milla Rwana de Araújo Silva  
 Rayssa Vitória Lima da Silva  
 
-# Instruções de Execução
+## Instruções de Execução
 1. Inicie o servidor
 > servidor.py
 
@@ -13,11 +14,11 @@ Rayssa Vitória Lima da Silva
 
 3. Digite o nome do arquivo quando solicitado
 
-# Funcionamento
+## Funcionamento
 O cliente envia o pacote em pacotes de até 1024 btyes via UDP  
 O servidor recebe, salva, renomeia com o prefixo "leilao_" e devolve o arquivo ao cliente
 
-# Testes realizados
+## Testes realizados
 Arquivo "teste.txt" (< 1024 bytes)  
 Arquivo "imagem_pequena.png" (< 1024 bytes)  
 Arquivo "imagem.png" (> 1024 bytes)  

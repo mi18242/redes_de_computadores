@@ -6,10 +6,10 @@ Rayssa Vitória Lima da Silva
 
 # Instruções de Execução
 1. Inicie o servidor
-> python servidor.py
+> servidor.py
 
 2. Em outro terminal, execute o cliente
-> python primeira_parte.py
+> primeira_parte.py
 
 3. Digite o nome do arquivo quando solicitado
 

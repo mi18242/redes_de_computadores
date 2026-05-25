@@ -8,6 +8,50 @@ BUFFER_SIZE = 1024
 SERVER_HOST = '127.0.0.1'
 SERVER_PORT = 5000
 
+# Timeout do RDT 3.0
+TIMEOUT = 2
+
+
+def esperar_ack(sock, seq):
+    """
+    Espera ACK do pacote enviado.
+    Retorna True se receber ACK correto.
+    """
+
+    try:
+        ack, _ = sock.recvfrom(BUFFER_SIZE)
+
+        ack = ack.decode('utf-8')
+
+        if ack == f"ACK:{seq}":
+            print(f"ACK {seq} recebido")
+            return True
+
+        print("ACK incorreto recebido")
+        return False
+
+    except socket.timeout:
+        print(f"Timeout do pacote {seq}")
+        return False
+
+
+def enviar_pacote_rdt(sock, dados, seq):
+    """
+    Envia pacote usando lógica do RDT 3.0.
+    """
+
+    pacote = f"{seq}|".encode('utf-8') + dados
+
+    while True:
+        print(f"Enviando pacote {seq}")
+
+        sock.sendto(pacote, (SERVER_HOST, SERVER_PORT))
+
+        if esperar_ack(sock, seq):
+            break
+
+        print(f"Reenviando pacote {seq}")
+
 
 def receber_arquivo_devolvido(sock, pasta_saida="."):
     """
@@ -48,31 +92,47 @@ def enviar_arquivo(sock, nome_arquivo):
         print('Arquivo não encontrado.')
         return
 
+    # Número de sequência inicial
+    seq = 0
+
     # Envia inicialmente só o nome do arquivo para o servidor
-    sock.sendto(os.path.basename(nome_arquivo).encode('utf-8'), (SERVER_HOST, SERVER_PORT))
+    enviar_pacote_rdt(
+        sock,
+        os.path.basename(nome_arquivo).encode('utf-8'),
+        seq
+    )
+
+    seq = 1 - seq
 
     # Abre o arquivo em modo binário
     with open(nome_arquivo, 'rb') as arquivo:
         while True:
             # Lê um bloco de até 1024 bytes
-            dados = arquivo.read(BUFFER_SIZE)
+            dados = arquivo.read(BUFFER_SIZE - 2)
 
             # Se não tiver mais dados, encerra
             if not dados:
                 break
 
             # Envia o bloco ao servidor
-            sock.sendto(dados, (SERVER_HOST, SERVER_PORT))
+            enviar_pacote_rdt(sock, dados, seq)
+
+            # Alterna número de sequência (0 e 1)
+            seq = 1 - seq
 
     # Marca fim da transmissão
-    sock.sendto(b'FIM_ARQUIVO', (SERVER_HOST, SERVER_PORT))
+    enviar_pacote_rdt(sock, b'FIM_ARQUIVO', seq)
 
     print('Arquivo enviado com sucesso.')
+
 
 def main():
 
     # Socket UDP do cliente
     cliente = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+
+    # Configura timeout do RDT
+    cliente.settimeout(TIMEOUT)
 
     # Solicita ao usuário o nome do arquivo que vai ser enviado
     nome_arquivo = input('Digite o nome do arquivo que deseja enviar: ')

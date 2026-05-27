@@ -20,18 +20,17 @@ def esperar_ack(sock, seq):
 
     try:
         ack, _ = sock.recvfrom(BUFFER_SIZE)
-
         ack = ack.decode('utf-8')
 
         if ack == f"ACK:{seq}":
-            print(f"ACK {seq} recebido")
+            print(f"[CLIENTE] ACK {seq} recebido")
             return True
 
-        print("ACK incorreto recebido")
+        print("[CLIENTE] ACK incorreto recebido")
         return False
 
     except socket.timeout:
-        print(f"Timeout do pacote {seq}")
+        print(f"[CLIENTE] Timeout do pacote {seq}")
         return False
 
 
@@ -40,17 +39,18 @@ def enviar_pacote_rdt(sock, dados, seq):
     Envia pacote usando lógica do RDT 3.0.
     """
 
-    pacote = f"{seq}|".encode('utf-8') + dados
+    cabecalho = f"{seq}|".encode('utf-8')
+    pacote = cabecalho + dados
 
     while True:
-        print(f"Enviando pacote {seq}")
+        print(f"[CLIENTE] Enviando pacote {seq}")
 
         sock.sendto(pacote, (SERVER_HOST, SERVER_PORT))
 
         if esperar_ack(sock, seq):
             break
 
-        print(f"Reenviando pacote {seq}")
+        print(f"[CLIENTE] Reenviando pacote {seq}")
 
 
 def receber_arquivo_devolvido(sock, pasta_saida="."):
@@ -77,7 +77,7 @@ def receber_arquivo_devolvido(sock, pasta_saida="."):
 
             arquivo.write(dados)
 
-    print(f"Arquivo devolvido salvo em: {caminho_saida}")
+    print(f"[CLIENTE] Arquivo devolvido salvo em: {caminho_saida}")
     return caminho_saida
 
 
@@ -85,12 +85,13 @@ def enviar_arquivo(sock, nome_arquivo):
     """
     Função criada pela Pessoa 1 para organizar o envio.
     Isso será essencial para implementar RDT 3.0 depois.
+    Também retorna se enviou ou não
     """
 
     # Verifica se o arquivo existe no diretório atual
     if not os.path.exists(nome_arquivo):
         print('Arquivo não encontrado.')
-        return
+        return False
 
     # Número de sequência inicial
     seq = 0
@@ -123,11 +124,15 @@ def enviar_arquivo(sock, nome_arquivo):
     # Marca fim da transmissão
     enviar_pacote_rdt(sock, b'FIM_ARQUIVO', seq)
 
-    print('Arquivo enviado com sucesso.')
+    print('[CLIENTE] Arquivo enviado com sucesso.')
+
+    # Diz para o servidor que esta pronto para receber
+    sock.sendto(b'PRONTO_RECEBER', (SERVER_HOST, SERVER_PORT))
+
+    return True
 
 
 def main():
-
     # Socket UDP do cliente
     cliente = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 
@@ -138,10 +143,12 @@ def main():
     nome_arquivo = input('Digite o nome do arquivo que deseja enviar: ')
 
     # Envio do arquivo (agora modularizado)
-    enviar_arquivo(cliente, nome_arquivo)
+    sucesso = enviar_arquivo(cliente, nome_arquivo)
 
-    # Recebe o arquivo devolvido pelo servidor
-    receber_arquivo_devolvido(cliente, ".")
+    # Se o arquivo foi enviado, recebe o arquivo devolvido pelo servidor
+    if sucesso:
+        cliente.settimeout(None) # Garante que recebe o arquivo de volta, sem tempo limite
+        receber_arquivo_devolvido(cliente, ".")
 
     # Fecha o socket após terminar tudo
     cliente.close()

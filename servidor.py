@@ -1,90 +1,169 @@
 import socket
 import os
+import random
 
 HOST = '0.0.0.0'     # Faz o servidor escutar em todas as interfaces de rede
 PORT = 5000          # Porta onde o servidor ficará disponível
-BUFFER_SIZE = 1024   # Tamanho máximo de cada pacote 
+BUFFER_SIZE = 1024   # Tamanho máximo de cada pacote
 PREFIXO = "leilao_"  # Prefixo que será adicionado ao nome do arquivo recebido
 
+# Probabilidade de perda simulada
+LOSS_PROBABILITY = 0.3
 
 
-def receber_arquivo(sock, nome_arquivo):
+def simular_perda():
     """
-    Recebe os fragmentos do cliente e salva o arquivo já com o prefixo leilao_.
+    Simula perda aleatória de pacotes ou ACKs.
+    """
+    return random.random() < LOSS_PROBABILITY
+
+
+def enviar_ack(sock, client_addr, seq):
+    """
+    Envia ACK para o cliente no formato ACK:<seq>.
+    Também simula perda de ACK.
     """
 
-    nome_arquivo = os.path.basename(nome_arquivo)
-    novo_nome = PREFIXO + nome_arquivo
+    # Simulação de perda do ACK
+    if simular_perda():
+        print(f"[SERVIDOR] ACK {seq} perdido (simulado)")
+        return
 
-    # Abre o arquivo em modo escrita binária
-    with open(novo_nome, "wb") as f:
-        while True:
-            # Recebe um pacote de dados do cliente
-            dados, _ = sock.recvfrom(BUFFER_SIZE)
+    ack = f"ACK:{seq}"
 
-            # Se receber o marcador de fim, encerra o loop
-            if dados == b'FIM_ARQUIVO':
-                break
+    sock.sendto(ack.encode('utf-8'), client_addr)
 
-            # Escreve os dados recebidos no arquivo
-            f.write(dados)
+    print(f"[SERVIDOR] ACK enviado {seq}")
 
-    # Retorna o nome do arquivo salvo
-    return novo_nome
+
+def receber_arquivo(sock):
+    """
+    Recebe os pacotes utilizando RDT 3.0.
+    O cliente envia no formato:
+    seq|dados
+    """
+
+    esperado = 0
+    arquivo = None
+    novo_nome = None
+
+    while True:
+        # Recebe pacote UDP
+        pacote, client_addr = sock.recvfrom(BUFFER_SIZE)
+
+        if pacote == b'PRONTO_RECEBER':
+            return "PRONTO_RECEBER", client_addr
+
+        # Simulação de perda de pacote
+        if simular_perda():
+            print("[SERVIDOR] Pacote perdido (simulado)")
+            continue
+
+        try:
+            # Separação do cabeçalho seq|dados
+            cabecalho, dados = pacote.split(b'|', 1)
+            seq = int(cabecalho.decode())
+
+        except:
+            print("[SERVIDOR] Pacote inválido")
+            continue
+
+        print(f"[SERVIDOR] Pacote recebido {seq}")
+
+    
+        if seq == esperado:
+            # Primeiro pacote = nome do arquivo
+            if arquivo is None:
+                nome_arquivo = dados.decode('utf-8', errors='ignore').strip()
+                nome_arquivo = os.path.basename(nome_arquivo)
+                novo_nome = PREFIXO + nome_arquivo
+                arquivo = open(novo_nome, "wb")
+
+                print(f"[SERVIDOR] Recebendo arquivo: {novo_nome}")
+
+            # Fim do arquivo
+            elif dados == b'FIM_ARQUIVO':
+                print("[SERVIDOR] Fim do arquivo")
+
+                # Lembra do ACK final
+                ack = f"ACK:{seq}"
+                sock.sendto(ack.encode('utf-8'), client_addr)
+                print(f"[SERVIDOR] ACK final enviado {seq}")
+
+                arquivo.close()
+
+                return novo_nome, client_addr
+
+            # Dados normais
+            else:
+                arquivo.write(dados)
+
+                print(f"[SERVIDOR] {len(dados)} bytes gravados")
+
+            # Envia ACK do pacote correto
+            enviar_ack(sock, client_addr, seq)
+
+            # Alterna sequência esperada
+            esperado = 1 - esperado
+
+
+        else:
+            print(f"[SERVIDOR] Pacote duplicado {seq}")
+
+            # Reenvia ACK do último pacote válido
+            enviar_ack(sock, client_addr, 1 - esperado)
 
 
 def enviar_arquivo(sock, client_addr, caminho_arquivo):
     """
-    Reenvia ao cliente o arquivo já salvo no servidor.
-    Primeiro envia o nome do arquivo e depois os bytes em blocos de até 1024.
+    Reenvia o arquivo ao cliente.
+    Mantido igual à primeira entrega.
     """
 
-    # Envia primeiro o nome do arquivo renomeado
-    sock.sendto(os.path.basename(caminho_arquivo).encode('utf-8'), client_addr)
+    sock.sendto(
+        os.path.basename(caminho_arquivo).encode('utf-8'),
+        client_addr
+    )
 
-    # Abre arquivo e envia em blocos
     with open(caminho_arquivo, "rb") as f:
         while True:
             bloco = f.read(BUFFER_SIZE)
+
             if not bloco:
                 break
+
             sock.sendto(bloco, client_addr)
 
-    # Marca fim da transmissão
     sock.sendto(b'FIM_ARQUIVO', client_addr)
 
+    print("[SERVIDOR] Arquivo devolvido ao cliente")
 
-def processar_cliente(sock):
-    """
-    Função criada pela Pessoa 1 para modularizar o fluxo principal.
-    Agora o main fica limpo e preparado para futuras mudanças (RDT 3.0).
-    """
-
-    # Recebe o nome do arquivo enviado pelo cliente
-    nome_bytes, client_addr = sock.recvfrom(BUFFER_SIZE)
-    nome_arquivo = nome_bytes.decode('utf-8', errors='ignore').strip()
-
-    print(f"Recebendo arquivo: {nome_arquivo} de {client_addr}")
-
-    # Recebe e salva o arquivo com prefixo
-    caminho_arquivo = receber_arquivo(sock, nome_arquivo)
-
-    print(f"Arquivo salvo como: {caminho_arquivo}")
-
-    # Devolve o arquivo renomeado ao cliente
-    enviar_arquivo(sock, client_addr, caminho_arquivo)
-
-    print(f"Arquivo devolvido ao cliente: {client_addr}")
 
 def main():
     servidor = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     servidor.bind((HOST, PORT))
 
-    print(f"Servidor UDP escutando em {HOST}:{PORT}")
+    print(f"[SERVIDOR] escutando em {HOST}:{PORT}")
 
     while True:
-        # Agora o fluxo principal foi separado em função (IMPORTANTE PARA RDT 3.0)
-        processar_cliente(servidor)
+        try:
+            # Recebe arquivo utilizando RDT 3.0
+            caminho_arquivo, client_addr = receber_arquivo(servidor)
+
+            print(f"[SERVIDOR] Arquivo salvo como: {caminho_arquivo}")
+
+            # Devolve o arquivo ao cliente
+            # (mantido simples para compatibilidade)
+            servidor.settimeout(10)
+            mensagem, _ = servidor.recvfrom(BUFFER_SIZE)
+            if mensagem == b'PRONTO_RECEBER':
+                enviar_arquivo(servidor, client_addr, caminho_arquivo)
+            servidor.settimeout(None)
+
+            print(f"Arquivo devolvido ao cliente: {client_addr}")
+
+        except Exception as erro:
+            print(f"[ERRO] {erro}")
 
 
 if __name__ == "__main__":

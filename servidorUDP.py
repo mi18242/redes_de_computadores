@@ -23,7 +23,8 @@ def enviar_ack(sock, client_addr, seq):
     print(f"[RDT 3.0] ACK enviado -> {seq}")
 
 def receber_arquivo_rdt(sock):
-    """Recebe pacotes do cliente utilizando RDT 3.0 corrigido para pacotes tardios."""
+    """Recebe pacotes do cliente utilizando RDT 3.0.
+    Adicionada redundância no ACK final para evitar dessincronização de estados."""
     esperado = 0
     arquivo = None
     novo_nome = None
@@ -31,19 +32,22 @@ def receber_arquivo_rdt(sock):
 
     while True:
         try:
+            # BUFFER_SIZE estrito de 1024 bytes
             pacote, addr = sock.recvfrom(BUFFER_SIZE)
             client_addr = addr
 
+            # Gerador de perda original mantido
             if simular_perda():
                 print("[RDT 3.0] Pacote recebido foi ignorado (Perda simulada)")
                 continue
-
+            # Separa o cabeçalho de 1 byte de sequência + 1 byte de separador '|'
             cabecalho, dados = pacote.split(b'|', 1)
             seq = int(cabecalho.decode())
             print(f"[RDT 3.0] Pacote recebido -> SEQ {seq}")
 
             if seq == esperado:
                 if arquivo is None:
+                    # Primeiro pacote: decodifica o nome do arquivo original
                     nome_arquivo = dados.decode('utf-8', errors='ignore').strip()
                     novo_nome = PREFIXO + os.path.basename(nome_arquivo)
                     arquivo = open(novo_nome, "wb")
@@ -51,8 +55,10 @@ def receber_arquivo_rdt(sock):
                 elif dados == b'FIM_ARQUIVO':
                     print("[RDT 3.0] Fim do arquivo recebido com sucesso")
                     arquivo.close()
-                    
-                    # Envia o ACK final múltiplas vezes para garantir que o cliente saia do loop
+
+                    # Envia o ACK final 3 vezes seguidas.
+                    # Se o primeiro ACK sumir na perda de 30%, os outros garantem que o 
+                    # cliente saia do loop de envio e não envie pacotes duplicados tardios.
                     for _ in range(3):
                         enviar_ack(sock, client_addr, seq)
                     return novo_nome, client_addr
@@ -60,8 +66,9 @@ def receber_arquivo_rdt(sock):
                     arquivo.write(dados)
                 
                 enviar_ack(sock, client_addr, seq)
-                esperado = 1 - esperado
+                esperado = 1 - esperado # Alterna o bit de seq esperado
             else:
+                # Se receber um pacote duplicado, reenvia o ACK do anterior para sincronizar o cliente
                 print(f"[RDT 3.0] Pacote duplicado (esperado {esperado}, veio {seq}). Reenviando ACK.")
                 enviar_ack(sock, client_addr, 1 - esperado)
 

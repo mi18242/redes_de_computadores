@@ -1,45 +1,50 @@
 import socket
-import os
 import threading
 import time
 import random
 from queue import Queue, Empty
 
-# ==========================
-# CONSTANTES E GLOBAIS
-# ==========================
-HOST = '0.0.0.0'     
-PORT = 5000          
-BUFFER_SIZE = 1024   
-PREFIXO = "leilao_"  
-
-# Configurações de RDT atualizadas (servidorUDP.py)
+HOST = '0.0.0.0'
+PORT = 5000
+BUFFER_SIZE = 1024
 LOSS_PROBABILITY = 0.3
-TIMEOUT_VAL = 1.0
+TIMEOUT_VAL = 2.0
 
-# Estruturas compartilhadas do servidor (Pessoa 1 + Pessoa 2)
+# ==========================
+# ESTADOS GLOBAIS
+# ==========================
 clientes = {}
 leiloes_ativos = {}
 usuarios_online = {}
 proximo_id = 1
 
+# ==========================
+# LOCKS DE SEGURANÇA
+# ==========================
+lock_usuarios = threading.Lock()
+lock_leiloes = threading.Lock()
+
 
 # ==========================
-# REGRAS DE NEGÓCIO E INTERPRETADOR (Pessoa 2)
+# REGRAS DE NEGÓCIO
 # ==========================
 def fazer_login(nome, endereco):
-    if nome in usuarios_online:
-        return "ERRO: usuário já conectado"
-    usuarios_online[nome] = endereco
+    with lock_usuarios:
+        if nome in usuarios_online:
+            return "ERRO: usuário já conectado"
+        usuarios_online[nome] = endereco
+    print(f"[LOGIN] {nome} conectado de {endereco}")
     return "Você está online"
 
 def fazer_logout(nome):
-    if nome not in usuarios_online:
-        return "ERRO: usuário não está online"
-    del usuarios_online[nome]
+    with lock_usuarios:
+        if nome not in usuarios_online:
+            return "ERRO: usuário não está online"
+        del usuarios_online[nome]
+    print(f"[LOGOUT] {nome} desconectado")
     return "Logout realizado"
 
-def criar_leilao(produto, preco, tempo):
+def criar_leilao(produto, preco, tempo, criador):
     global proximo_id
     try:
         preco = float(preco)
@@ -52,38 +57,47 @@ def criar_leilao(produto, preco, tempo):
     if tempo <= 0:
         return "ERRO: tempo inválido"
 
-    leiloes_ativos[proximo_id] = {
-        "produto": produto,
-        "preco": preco,
-        "lance_atual": preco,
-        "tempo_restante": tempo, # Ajustado de 'tempo' para 'tempo_restante' para compatibilidade com Pessoa 1
-        "ativo": True,
-        "lances": 0
-    }
+    with lock_usuarios:
+        if criador not in usuarios_online:
+            return "ERRO: faça login primeiro para criar leilões"
 
-    resposta = (
+    with lock_leiloes:
+        leiloes_ativos[proximo_id] = {
+            "produto": produto,
+            "preco": preco,
+            "lance_atual": preco,
+            "tempo_restante": tempo,
+            "ativo": True,
+            "lances": 0,
+            "maior_lance": None,
+            "criador": criador
+        }
+        id_leilao = proximo_id
+        proximo_id += 1
+
+    return (
         f"Leilão criado\n"
-        f"ID: {proximo_id}\n"
+        f"ID: {id_leilao}\n"
         f"Produto: {produto}\n"
-        f"Preço inicial: {preco}"
+        f"Preço inicial: {preco}\n"
+        f"Tempo: {tempo}s"
     )
-    proximo_id += 1
-    return resposta
 
 def listar_leiloes():
-    if not leiloes_ativos:
-        return "Nenhum leilão ativo"
-    
-    resposta = ""
-    for id, item in leiloes_ativos.items():
-        if item["ativo"]:
-            resposta += (
-                f"\nID: {id}"
-                f"\nProduto: {item['produto']}"
-                f"\nPreço: R${item['preco']}"
-                f"\nTempo: {item.get('tempo_restante', 0)}s"
-                f"\n"
-            )
+    with lock_leiloes:
+        if not leiloes_ativos:
+            return "Nenhum leilão ativo"
+
+        resposta = ""
+        for id, item in leiloes_ativos.items():
+            if item["ativo"]:
+                resposta += (
+                    f"\nID: {id}"
+                    f"\nProduto: {item['produto']}"
+                    f"\nPreço: R${item['preco']}"
+                    f"\nTempo: {item.get('tempo_restante', 0)}s"
+                    f"\n"
+                )
     return resposta
 
 def dar_lance(usuario, id_item, valor):
@@ -93,23 +107,38 @@ def dar_lance(usuario, id_item, valor):
     except:
         return "ERRO: dados inválidos"
 
-    if usuario not in usuarios_online:
-        return "ERRO: faça login primeiro"
-    if id_item not in leiloes_ativos:
-        return "ERRO: item inexistente"
+    with lock_usuarios:
+        if usuario not in usuarios_online:
+            return "ERRO: faça login primeiro"
 
-    item = leiloes_ativos[id_item]
-    if item["ativo"] == False:
-        return "ERRO: leilão encerrado"
-    if valor <= item["preco"]:
-        return "ERRO: lance precisa ser maior que o atual"
+    with lock_leiloes:
+        if id_item not in leiloes_ativos:
+            return "ERRO: item inexistente"
 
-    item["preco"] = valor
-    item["maior_lance"] = usuario
-    item["lances"] += 1
+        item = leiloes_ativos[id_item]
+        if not item["ativo"]:
+            return "ERRO: leilão encerrado"
+        if valor <= item["preco"]:
+            return "ERRO: lance precisa ser maior que o atual"
 
-    if item["lances"] >= 5:
-        item["ativo"] = False
+        item["preco"] = valor
+        item["maior_lance"] = usuario
+        item["lances"] += 1
+
+        produto = item["produto"]
+        lances_atual = item["lances"]
+        encerrou = False
+
+        if item["lances"] >= 5:
+            item["ativo"] = False
+            encerrou = True
+
+    msg_broadcast = f"{usuario} deu lance de R${valor} em {produto}! (Lance {lances_atual}/5)"
+    broadcast(msg_broadcast)
+
+    if encerrou:
+        msg_encerramento = f"LEILÃO ENCERRADO! {produto} vendido para {usuario} por R${valor}!"
+        broadcast(msg_encerramento)
 
     return (
         f"Lance aceito\n"
@@ -118,46 +147,147 @@ def dar_lance(usuario, id_item, valor):
         f"Usuário: {usuario}"
     )
 
-def tratar_comando(mensagem, usuario):
+def status_leiloes():
+    with lock_leiloes:
+        if not leiloes_ativos:
+            return "Nenhum leilão ativo"
+
+        resposta = "=== STATUS ===\n"
+        for id, item in leiloes_ativos.items():
+            maior = item.get("maior_lance", "Ninguém")
+            status = "ATIVO" if item["ativo"] else "ENCERRADO"
+            resposta += (
+                f"\nID {id}: {item['produto']}"
+                f"\n  Status: {status}"
+                f"\n  Vencedor: {maior}"
+                f"\n  Preço: R${item['preco']}"
+                f"\n"
+            )
+    return resposta
+
+def tratar_comando(mensagem, usuario, endereco_real=None):
+    """
+    Processa comando. 
+    'usuario' é o nome logado ou None.
+    'endereco_real' é a tupla (ip, porta) do cliente, usada para login.
+    """
     partes = mensagem.split()
     if len(partes) == 0:
         return "Comando vazio"
 
-    comando = partes[0]
+    comando = partes[0].lower()
 
     if comando == "login":
-        return fazer_login(partes[1], usuario) # Aqui 'usuario' contem o client_addr
+        if len(partes) < 2:
+            return "ERRO: informe o nome do usuário"
+        # Para login, usa o endereço REAL (tupla) para registrar
+        addr = endereco_real if endereco_real else usuario
+        return fazer_login(partes[1], addr)
     elif comando == "logout":
         return fazer_logout(usuario)
     elif comando == "create":
-        return criar_leilao(partes[1], partes[2], partes[3])
+        if len(partes) < 4:
+            return "ERRO: uso correto: create <produto> <preço> <tempo_segundos>"
+        return criar_leilao(partes[1], partes[2], partes[3], usuario)
     elif comando == "list":
         return listar_leiloes()
     elif comando == "bid":
+        if len(partes) < 3:
+            return "ERRO: uso correto: bid <id_leilao> <valor>"
         return dar_lance(usuario, partes[1], partes[2])
+    elif comando == "status":
+        return status_leiloes()
     else:
         return "Comando inválido"
 
 
 # ==========================
-# RDT 3.0 E REDE (servidorUDP.py + Pessoa 1)
+# BROADCAST - FIRE AND FORGET
+# ==========================
+def broadcast(mensagem):
+    """Envia mensagem para todos os usuários online — SEM RDT/ACK."""
+    with lock_usuarios:
+        destinatarios = list(usuarios_online.items())
+        print(f"[BROADCAST] Enviando para {len(destinatarios)} usuários: {mensagem[:60]}...")
+
+    for nome, addr in destinatarios:
+        print(f"[BROADCAST] Tentando enviar para {nome} em {addr} (tipo: {type(addr)})")
+        sessao = clientes.get(addr)
+        if sessao and sessao.get("ativa"):
+            try:
+                pacote = f"BROADCAST|{mensagem}".encode('utf-8')
+                sock = sessao["sock"]
+                
+                # Enviar o Broadcast
+                sock.sendto(pacote, addr)
+                print(f"[BROADCAST] ✓ Enviado para {nome} em {addr}")
+                
+            except Exception as e:
+                print(f"[BROADCAST ERRO] Falha ao enviar para {nome}: {e}")
+        else:
+            print(f"[BROADCAST] ✗ Cliente {nome} ({addr}) não encontrado ou inativo")
+            # Limpa usuário "zumbi"
+            with lock_usuarios:
+                if nome in usuarios_online and usuarios_online.get(nome) == addr:
+                    del usuarios_online[nome]
+                    print(f"[BROADCAST] Limpado usuário zumbi: {nome}")
+
+
+# ==========================
+# RDT 3.0 - REDE
 # ==========================
 def simular_perda():
-    """Simula perda aleatória de pacotes ou ACKs (Atualizado do servidorUDP)."""
     return random.random() < LOSS_PROBABILITY
 
 def enviar_ack(sock, client_addr, seq):
-    """Envia ACK para o cliente e simula perda (Atualizado do servidorUDP)."""
     if simular_perda():
-        print(f"[RDT 3.0] ACK {seq} perdido (simulado)")
+        print(f"[SERVIDOR] ACK {seq} perdido (simulado)")
         return
     ack = f"ACK:{seq}"
-    sock.sendto(ack.encode('utf-8'), client_addr)
-    print(f"[RDT 3.0] ACK enviado -> {seq}")
+    try:
+        sock.sendto(ack.encode('utf-8'), client_addr)
+        print(f"[SERVIDOR] ACK enviado {seq} para {client_addr}")
+    except OSError:
+        print(f"[SERVIDOR] Falha ao enviar ACK para {client_addr}")
+
+def enviar_pacote_rdt(client_addr, mensagem_str):
+    """Envio confiável para um cliente específico (respostas normais)."""
+    mensagem_bytes = mensagem_str.encode('utf-8') if isinstance(mensagem_str, str) else mensagem_str
+
+    sessao = clientes.get(client_addr)
+    if not sessao:
+        print(f"[ENVIO ERRO] Sessão não encontrada para {client_addr}")
+        return
+
+    seq = sessao["seq_envio"]
+    pacote = f"{seq}|".encode('utf-8') + mensagem_bytes
+    sock = sessao["sock"]
+
+    while True:
+        if simular_perda():
+            print(f"[ENVIO] Pacote SEQ {seq} perdido (simulado) para {client_addr}")
+        else:
+            try:
+                sock.sendto(pacote, client_addr)
+                print(f"[ENVIO] Pacote enviado -> SEQ {seq} para {client_addr}")
+            except OSError:
+                print(f"[ENVIO] Cliente {client_addr} desconectado")
+                return
+
+        try:
+            ack_dados = sessao["fila_acks"].get(timeout=TIMEOUT_VAL)
+            ack_msg = ack_dados.decode('utf-8', errors='ignore').strip()
+            if ack_msg == f"ACK:{seq}":
+                sessao["seq_envio"] = 1 - seq
+                print(f"[ENVIO] ACK {seq} confirmado, próximo seq = {sessao['seq_envio']}")
+                break
+        except Empty:
+            print(f"[TIMEOUT] Sem ACK de {client_addr}, retransmitindo...")
+            continue
 
 def criar_sessao_cliente(sock, client_addr):
-    """Cria a estrutura de atendimento de um cliente e inicia a thread dedicada."""
     if client_addr in clientes:
+        print(f"[SESSAO] Cliente {client_addr} já existe")
         return
 
     clientes[client_addr] = {
@@ -166,6 +296,7 @@ def criar_sessao_cliente(sock, client_addr):
         "seq_esperado": 0,
         "seq_envio": 0,
         "ativa": True,
+        "sock": sock,
     }
 
     thread_cliente = threading.Thread(
@@ -175,50 +306,12 @@ def criar_sessao_cliente(sock, client_addr):
     )
     thread_cliente.start()
     clientes[client_addr]["thread"] = thread_cliente
-    print(f"Nova thread criada para o cliente {client_addr}")
-
-def desempacotar_pacote(pacote):
-    """Espera o formato: seq|dados"""
-    if b'|' not in pacote:
-        return None, None
-    seq_bruta, dados = pacote.split(b'|', 1)
-    try:
-        seq = int(seq_bruta.decode('utf-8', errors='ignore'))
-    except ValueError:
-        return None, None
-    return seq, dados
-
-def enviar_rdt(sock, client_addr, mensagem_bytes):
-    """Envio confiável do lado do servidor usando stop-and-wait por thread."""
-    sessao = clientes.get(client_addr)
-    if not sessao:
-        return
-
-    seq = sessao["seq_envio"]
-    while True:
-        pacote = f"{seq}|".encode('utf-8') + mensagem_bytes
-        
-        # Simula perda no envio do pacote também, mantendo consistência com RDT 3.0 atualizado
-        if simular_perda():
-            print(f"[RDT 3.0] Envio do pacote SEQ {seq} falhou (Perda simulada)")
-        else:
-            sock.sendto(pacote, client_addr)
-
-        try:
-            # Substituído TIMEOUT_RDT antigo pelo TIMEOUT_VAL atualizado
-            ack_dados = sessao["fila_acks"].get(timeout=TIMEOUT_VAL)
-            ack_msg = ack_dados.decode('utf-8', errors='ignore').strip()
-            
-            if ack_msg == f"ACK:{seq}":
-                sessao["seq_envio"] = 1 - seq
-                break
-        except Empty:
-            print(f"[TIMEOUT] Sem resposta para pacote SEQ {seq} de {client_addr}. Retransmitindo...")
-            continue
+    print(f"[SESSAO] Nova thread criada para {client_addr}")
 
 def processar_cliente(sock, client_addr):
-    """Thread dedicada a um cliente. Recebe comandos via fila e aplica RDT 3.0."""
+    """Thread dedicada a um cliente."""
     sessao = clientes[client_addr]
+    usuario_atual = None
 
     while sessao["ativa"]:
         try:
@@ -226,90 +319,151 @@ def processar_cliente(sock, client_addr):
         except Empty:
             continue
 
-        seq, dados = desempacotar_pacote(pacote)
-        if seq is None:
+        if b'|' not in pacote:
+            continue
+
+        try:
+            cabecalho, dados = pacote.split(b'|', 1)
+            seq = int(cabecalho.decode())
+        except:
             continue
 
         if seq == sessao["seq_esperado"]:
             texto = dados.decode('utf-8', errors='ignore')
-            
-            # ADAPTAÇÃO NECESSÁRIA: Descobrir o nome do usuário a partir do endereço
-            # para passar para o parser da Pessoa 2
-            usuario_nome = client_addr
-            for nome, addr in usuarios_online.items():
-                if addr == client_addr:
-                    usuario_nome = nome
-                    break
+            print(f"[PROCESSAR] Comando de {client_addr}: {texto[:40]}")
 
-            # Processa usando as regras de negócio da Pessoa 2
-            resposta = tratar_comando(texto, usuario_nome)
+            # Atualiza usuario_atual se for login
+            if texto.lower().startswith("login "):
+                partes = texto.split()
+                if len(partes) >= 2:
+                    usuario_atual = partes[1]
+
+            # Determina quem está executando o comando
+            if texto.lower().startswith("login"):
+                # Login: ainda não tem usuario_atual definido, passa endereço real
+                nome_para_comando = None
+                endereco_real = client_addr  # TUPLA REAL (ip, porta)
+            else:
+                # Outros comandos: precisa estar logado
+                nome_para_comando = usuario_atual
+                endereco_real = None
+
+            # Se não está logado e não é login, erro
+            if nome_para_comando is None and not texto.lower().startswith("login"):
+                enviar_ack(sock, client_addr, seq)
+                sessao["seq_esperado"] = 1 - sessao["seq_esperado"]
+                enviar_pacote_rdt(client_addr, "ERRO: faça login primeiro")
+                continue
+
+            # Executa comando
+            resposta = tratar_comando(texto, nome_para_comando, endereco_real)
+            print(f"[PROCESSAR] Resposta: {resposta[:40]}")
+
+            # Logout: limpa antes de enviar resposta
+            if texto.lower().startswith("logout"):
+                if usuario_atual and usuario_atual in usuarios_online:
+                    with lock_usuarios:
+                        if usuario_atual in usuarios_online:
+                            del usuarios_online[usuario_atual]
+                usuario_atual = None
 
             enviar_ack(sock, client_addr, seq)
             sessao["seq_esperado"] = 1 - sessao["seq_esperado"]
 
             if resposta is not None:
-                if isinstance(resposta, str):
-                    resposta = resposta.encode('utf-8')
-                enviar_rdt(sock, client_addr, resposta)
+                enviar_pacote_rdt(client_addr, resposta)
+
+            if texto.lower().startswith("logout"):
+                sessao["ativa"] = False
+                print(f"[PROCESSAR] Desconectado de {client_addr}")
+                break
         else:
-            enviar_ack(sock, client_addr, 1 - sessao["seq_esperado"])
+            ultimo_ack = 1 - sessao["seq_esperado"]
+            print(f"[PROCESSAR] Pacote duplicado ({seq} != {sessao['seq_esperado']}), reenviando ACK {ultimo_ack}")
+            enviar_ack(sock, client_addr, ultimo_ack)
+
+    # LIMPEZA ao finalizar
+    print(f"[SESSAO] Thread finalizada para {client_addr}")
+    if usuario_atual and usuario_atual in usuarios_online:
+        with lock_usuarios:
+            if usuario_atual in usuarios_online:
+                del usuarios_online[usuario_atual]
+                print(f"[SESSAO] Removido {usuario_atual} de usuarios_online")
+    if client_addr in clientes:
+        del clientes[client_addr]
+        print(f"[SESSAO] Removido {client_addr} de clientes")
 
 def receber_pacotes(sock):
     """Loop principal do servidor (Despachante)."""
     while True:
-        dados, client_addr = sock.recvfrom(BUFFER_SIZE)
+        try:
+            pacote, client_addr = sock.recvfrom(BUFFER_SIZE)
+        except OSError:
+            print("[SERVIDOR] Socket encerrado")
+            break
 
-        # Atualizado para a função de perda probabilística da versão mais recente
         if simular_perda():
-            print(f"[RDT 3.0] Pacote perdido simulado de {client_addr}")
+            print(f"[RECEBER] Pacote perdido (simulado) de {client_addr}")
             continue
 
         if client_addr not in clientes:
             criar_sessao_cliente(sock, client_addr)
 
-        sessao = clientes[client_addr]
+        sessao = clientes.get(client_addr)
+        if not sessao:
+            continue
 
-        if dados.startswith(b'ACK:'):
-            sessao["fila_acks"].put(dados)
+        if pacote.startswith(b'ACK:'):
+            sessao["fila_acks"].put(pacote)
         else:
-            sessao["fila_comandos"].put(dados)
+            sessao["fila_comandos"].put(pacote)
 
 def cronometro_leiloes():
-    """Thread em background que reduz o tempo dos leilões ativos (Pessoa 1)."""
+    """Thread em background que decrementa tempo dos leilões."""
     while True:
         time.sleep(1)
         if not leiloes_ativos:
             continue
 
-        # Convertido para list para evitar erros ao iterar um dicionário mutável
-        for id_item, leilao in list(leiloes_ativos.items()):
-            if not leilao.get("ativo", True):
-                continue
+        encerrados = []
+        with lock_leiloes:
+            for id_item, leilao in list(leiloes_ativos.items()):
+                if not leilao.get("ativo", True):
+                    continue
+                tempo = leilao.get("tempo_restante")
+                if tempo is None:
+                    continue
+                if tempo > 0:
+                    leilao["tempo_restante"] = tempo - 1
+                if leilao["tempo_restante"] <= 0:
+                    leilao["ativo"] = False
+                    encerrados.append((id_item, leilao))
+                    print(f"[TIMER] Leilão encerrado para o item {id_item}")
 
-            tempo_restante = leilao.get("tempo_restante")
-            if tempo_restante is None:
-                continue
+        for id_item, leilao in encerrados:
+            produto = leilao["produto"]
+            vencedor = leilao.get("maior_lance", "Ninguém")
+            preco = leilao["preco"]
+            msg = f"LEILÃO ENCERRADO POR TEMPO! {produto} (ID {id_item}) - Vencedor: {vencedor} com R${preco}"
+            broadcast(msg)
 
-            if tempo_restante > 0:
-                leilao["tempo_restante"] = tempo_restante - 1
-
-            if leilao["tempo_restante"] <= 0:
-                leilao["ativo"] = False
-                print(f"Leilão encerrado para o item {id_item}")
 
 def main():
     servidor = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     servidor.bind((HOST, PORT))
-    print(f"Servidor UDP RDT 3.0 (Leilão Multiusuário) operando em {HOST}:{PORT}")
+    print(f"[SERVIDOR] AuctionCin operando em {HOST}:{PORT}")
 
-    thread_recebimento = threading.Thread(target=receber_pacotes, args=(servidor,), daemon=True)
-    thread_recebimento.start()
+    threading.Thread(target=receber_pacotes, args=(servidor,), daemon=True).start()
+    threading.Thread(target=cronometro_leiloes, daemon=True).start()
 
-    thread_timer = threading.Thread(target=cronometro_leiloes, daemon=True)
-    thread_timer.start()
-
-    while True:
-        time.sleep(1)
+    print("[SERVIDOR] Aguardando conexões...")
+    try:
+        while True:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        print("\n[SERVIDOR] Encerrando...")
+    finally:
+        servidor.close()
 
 if __name__ == "__main__":
     main()

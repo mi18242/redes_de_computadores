@@ -1,103 +1,192 @@
 import socket
 import sys
+import select
 
 BUFFER_SIZE = 1024
 SERVER_HOST = '127.0.0.1'
 SERVER_PORT = 5000
-TIMEOUT_VAL = 1.5  # Tempo pra esperar o ACK antes de transmitir de novo
+TIMEOUT = 2
 
-def enviar_mensagem_rdt(sock, mensagem, seq_atual):
-    """
-    Envia uma string de texto usando o protocolo RDT 3.0 
-    Garante que o comando chegue ao despachante do servidor mesmo com 30% de perda.
-    """
-    # seq|dados
-    pacote = f"{seq_atual}|{mensagem}".encode('utf-8')
-    
+
+def limpar_buffer(sock):
+    """Limpa pacotes pendentes no socket."""
     while True:
+        prontos, _, _ = select.select([sock], [], [], 0)
+        if not prontos:
+            break
         try:
-            # Envia o pacote pro servidor
-            sock.sendto(pacote, (SERVER_HOST, SERVER_PORT))
-            print(f"[RDT 3.0] Enviando: '{mensagem}' com SEQ {seq_atual}...")
+            sock.recvfrom(BUFFER_SIZE)
+        except OSError:
+            break
 
-            # timeout para aguardar a resposta 
-            sock.settimeout(TIMEOUT_VAL)
-            
-            # Espera resposta do servidor
-            resposta, _ = sock.recvfrom(BUFFER_SIZE)
-            msg_recebida = resposta.decode('utf-8').strip()
 
-            # Servidor responde ACK:<seq>
-            if msg_recebida == f"ACK:{seq_atual}":
-                print(f"[RDT 3.0] ACK {seq_atual} confirmado pelo servidor!")
-                break  # Pacote foi entregue com sucesso
+def verificar_broadcasts(sock):
+    """Verifica se há broadcasts pendentes e os exibe."""
+    while True:
+        prontos, _, _ = select.select([sock], [], [], 0)
+        if not prontos:
+            break
+        try:
+            pacote, _ = sock.recvfrom(BUFFER_SIZE)
+            if pacote.startswith(b'BROADCAST|'):
+                mensagem = pacote.split(b'|', 1)[1].decode('utf-8')
+                print(f"\n{'='*50}")
+                print(f"📢 BROADCAST: {mensagem}")
+                print(f"{'='*50}")
+        except:
+            break
+
+
+def enviar_e_receber_rdt(sock, dados, seq):
+    cabecalho = f"{seq}|".encode('utf-8')
+    pacote = cabecalho + dados
+
+    tentativas = 0
+    max_tentativas = 10
+
+    while tentativas < max_tentativas:
+        tentativas += 1
+        print(f"[CLIENTE] Enviando pacote {seq} (tentativa {tentativas})")
+        sock.sendto(pacote, (SERVER_HOST, SERVER_PORT))
+
+        while True:
+            try:
+                resposta, addr = sock.recvfrom(BUFFER_SIZE)
+            except socket.timeout:
+                print(f"[CLIENTE] Timeout, reenviando pacote {seq}...")
+                break
+
+            # Se for broadcast, mostra e continua esperando
+            if resposta.startswith(b'BROADCAST|'):
+                mensagem = resposta.split(b'|', 1)[1].decode('utf-8')
+                print(f"\n{'='*50}")
+                print(f"📢 BROADCAST: {mensagem}")
+                print(f"{'='*50}")
+                continue
+
+            resposta_str = resposta.decode('utf-8', errors='ignore')
+
+            if resposta_str == f"ACK:{seq}":
+                print(f"[CLIENTE] ACK {seq} recebido")
+                resposta_servidor = aguardar_resposta(sock, seq)
+                return True, resposta_servidor
+
+            if b'|' in resposta:
+                try:
+                    cabecalho_resp, dados_resp = resposta.split(b'|', 1)
+                    seq_resp = int(cabecalho_resp.decode())
+                except:
+                    continue
+
+                if seq_resp == seq:
+                    print(f"[CLIENTE] Resposta recebida diretamente (ACK perdido, SEQ {seq})")
+                    ack = f"ACK:{seq}"
+                    sock.sendto(ack.encode('utf-8'), (SERVER_HOST, SERVER_PORT))
+                    return True, dados_resp.decode('utf-8')
+                elif seq_resp == 1 - seq:
+                    print(f"[CLIENTE] Pacote duplicado anterior (SEQ {seq_resp}), enviando ACK")
+                    ack = f"ACK:{seq_resp}"
+                    sock.sendto(ack.encode('utf-8'), (SERVER_HOST, SERVER_PORT))
+                    continue
+                else:
+                    print(f"[CLIENTE] SEQ inesperado: {seq_resp}, ignorando")
+                    continue
+
+            print(f"[CLIENTE] Resposta inesperada: {resposta_str[:50]}")
+
+    return False, "[ERRO] Número máximo de tentativas excedido"
+
+
+def aguardar_resposta(sock, seq_esperado):
+    tentativas = 0
+    while tentativas < 5:
+        try:
+            pacote, server_addr = sock.recvfrom(BUFFER_SIZE)
+
+            # Se for broadcast, mostra e continua esperando
+            if pacote.startswith(b'BROADCAST|'):
+                mensagem = pacote.split(b'|', 1)[1].decode('utf-8')
+                print(f"\n{'='*50}")
+                print(f"BROADCAST: {mensagem}")
+                print(f"{'='*50}")
+                continue
+
+            if b'|' not in pacote:
+                continue
+
+            cabecalho, dados = pacote.split(b'|', 1)
+            seq = int(cabecalho.decode())
+
+            if seq == seq_esperado:
+                ack = f"ACK:{seq}"
+                sock.sendto(ack.encode('utf-8'), server_addr)
+                print(f"[CLIENTE] ACK enviado para resposta SEQ {seq}")
+                return dados.decode('utf-8')
             else:
-                print(f"[RDT 3.0] ACK incorreto ou duplicado ({msg_recebida}). Tentando novamente...")
+                ultimo_ack = 1 - seq_esperado
+                print(f"[CLIENTE] Resposta duplicada/atrasada ({seq}), enviando ACK {ultimo_ack}")
+                ack = f"ACK:{ultimo_ack}"
+                sock.sendto(ack.encode('utf-8'), server_addr)
 
         except socket.timeout:
-            # Se estourar o tempo e o ACK não vier, o RDT 3.0 retransmite o pacote
-            print(f"[TIMEOUT] Sem resposta para o pacote SEQ {seq_atual}. Retransmitindo comando...")
-            
-    # Seq alternada 
-    return 1 - seq_atual
+            tentativas += 1
+            print(f"[CLIENTE] Timeout aguardando resposta (tentativa {tentativas})")
+            continue
+        except Exception as e:
+            return f"[ERRO] {e}"
 
-def receber_resposta_servidor(sock):
-    """
-    Após o envio do comando e confirmação do ACK, o cliente fica 
-    esperando o resultado textual do comando processado pela Thread
-    """
-    # Remove o timeout 
-    sock.settimeout(None)
-    
-    try:
-        # Recebe o resultado do comando (ex: "Você está online", "Lista de leilões...", etc.)
-        dados, _ = sock.recvfrom(BUFFER_SIZE)
-        return dados.decode('utf-8')
-    except Exception as e:
-        return f"[ERRO AO RECEBER RESPOSTA] {e}"
+    return "[AVISO] Não foi possível receber resposta do servidor (timeout)"
+
 
 def main():
-    cliente_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    
-    # O cliente RDT 3.0 começa controlando o bit de sequência em 0
+    cliente = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    cliente.settimeout(TIMEOUT)
+
     seq_atual = 0
-    
+
     print("=" * 60)
     print("          BEM-VINDO AO AUCTIONCIN          ")
     print("=" * 60)
     print("Comandos disponíveis:")
     print("  -> login <seu_nome>")
     print("  -> logout")
-    print("  -> create <produto> <preço_inicial> <tempo_segundos>")
+    print("  -> create <produto> <preço> <tempo_segundos>")
     print("  -> list")
     print("  -> bid <id_leilao> <seu_lance>")
-    print("  -> sair (encerra o programa cliente)")
+    print("  -> status")
+    print("  -> sair")
     print("-" * 60)
 
     try:
         while True:
-            comando = input("\nDigite o comando: ").strip()
+            # Verifica broadcasts pendentes ANTES de pedir comando
+            verificar_broadcasts(cliente)
             
+            comando = input("\nDigite o comando: ").strip()
+
             if not comando:
                 continue
-                
+
             if comando.lower() == 'sair':
                 print("Encerrando aplicação cliente. Até logo!")
                 break
 
-            seq_atual = enviar_mensagem_rdt(cliente_socket, comando, seq_atual)
-            
-            print("Processando comando no servidor...")
-            resposta_leilao = receber_resposta_servidor(cliente_socket)
-            
+            limpar_buffer(cliente)
+            sucesso, resposta = enviar_e_receber_rdt(cliente, comando.encode('utf-8'), seq_atual)
+            seq_atual = 1 - seq_atual
+
             print("\n[RESPOSTA DO SERVIDOR]:")
-            print(resposta_leilao)
+            print(resposta if resposta else "[Sem resposta]")
             print("-" * 50)
+
+            # Verifica broadcasts que chegaram durante o processamento
+            verificar_broadcasts(cliente)
 
     except KeyboardInterrupt:
         print("\nCliente finalizado via teclado.")
     finally:
-        cliente_socket.close()
+        cliente.close()
+
 
 if __name__ == "__main__":
     main()
